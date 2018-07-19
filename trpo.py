@@ -25,7 +25,7 @@ class ConjugateGradientOptimizer(optimizer.Optimizer):
     # ls_max_iter: line search max iteration
     # back_trace_ratio: backward line search ratio per iteration
     def __init__(self, actions, delta=0.01, cg_iter=10, ls_max_iter=15, back_trace_ratio=0.8, use_locking=False, name="ConjGradient"):
-        super(ConjGradient, self).__init__(use_locking, name)
+        super(ConjugateGradientOptimizer, self).__init__(use_locking, name)
         self._cg_iter = cg_iter
         self._delta = delta
         self._ls_max_iter = ls_max_iter
