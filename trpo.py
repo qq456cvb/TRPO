@@ -129,16 +129,20 @@ class ConjugateGradientOptimizer(optimizer.Optimizer):
                              ([v.name for _, v in converted_grads_and_vars],))
         with ops.init_scope():
             self._create_slots(var_list)
-        var_shapes = [tf.shape(v) for _, v in converted_grads_and_vars]
-        slice_idx = tf.concat([tf.zeros([1], dtype=tf.int32), tf.cumsum([tf.reduce_prod(vs) for vs in var_shapes])], 0)
+        var_shapes = [v.shape for _, v in converted_grads_and_vars]
+        slice_idx = np.concatenate([[0], np.cumsum([np.prod(vs) for vs in var_shapes])], 0)
+        # print(var_shapes)
+        # print(slice_idx)
         with ops.name_scope(name, self._name) as name:
             self._prepare()
             grad_flatten = tf.concat([tf.reshape(grad, [-1]) for grad, _ in converted_grads_and_vars], 0)
-            KL_grad_flatten = tf.concat([tf.reshape(tf.gradients(self._mean_KL, var)[0], [-1]) for _, var in converted_grads_and_vars], 0)
+            KL_grad  = tf.gradients(self._mean_KL, var_list)
+            KL_grad_flatten = tf.concat([tf.reshape(g, [-1]) for g in KL_grad], 0)
 
             # calculate Hessian * x
             def Hx_fn(m):
-                return tf.concat([tf.reshape(tf.gradients(tf.reduce_sum(KL_grad_flatten * tf.stop_gradient(m)), var)[0], [-1]) for _, var in converted_grads_and_vars], 0) + 1e-5
+                grads = tf.gradients(tf.reduce_sum(KL_grad_flatten * tf.stop_gradient(m)), var_list)
+                return tf.concat([tf.reshape(g, [-1]) for g in grads], 0) + 1e-5
             x = self.cg(Hx_fn, grad_flatten)
             xHx = tf.reduce_sum(tf.transpose(x) * Hx_fn(x))
             beta = tf.sqrt(2 * self._delta_t / (xHx + 1e-8))
