@@ -19,7 +19,7 @@ from tensorpack import *
 from tensorpack.tfutils import optimizer
 from tensorpack.utils.concurrency import ensure_proc_terminate, start_proc_mask_signal
 from tensorpack.utils.serialize import dumps
-from tensorpack.tfutils.gradproc import MapGradient, SummaryGradient
+from tensorpack.tfutils.gradproc import MapGradient, SummaryGradient, FilterNoneGrad
 from tensorpack.utils.gpu import get_num_gpu
 
 
@@ -27,6 +27,11 @@ import gym
 from simulator import SimulatorProcess, SimulatorMaster, TransitionExperience
 from common import Evaluator, eval_model_multithread, play_n_episodes
 from atari_wrapper import MapState, FrameStack, FireResetEnv, LimitLength
+from tensorpack.tfutils.scope_utils import auto_reuse_variable_scope
+from tensorflow.python.ops import control_flow_ops, state_ops
+from tensorpack.utils.argtools import call_only_once, memoized
+from tensorpack.tfutils.tower import TowerFuncWrapper
+import tensorflow.contrib.slim as slim
 
 if six.PY3:
     from concurrent import futures
@@ -38,7 +43,7 @@ GAMMA = 0.99
 STATE_SHAPE = (4,)
 
 LOCAL_TIME_MAX = 5
-STEPS_PER_EPOCH = 100
+STEPS_PER_EPOCH = 10
 EVAL_EPISODE = 5
 BATCH_SIZE = 32
 PREDICT_BATCH_SIZE = 15     # batch for efficient forward
@@ -48,6 +53,7 @@ PREDICTOR_THREAD = None
 
 NUM_ACTIONS = None
 ENV_NAME = None
+KL_TOLERANCE = 0.001
 
 import trpo
 
@@ -69,12 +75,6 @@ class MySimulatorWorker(SimulatorProcess):
         return get_player(train=True)
 
 
-def calculate_loss(policy, action, futurereward, action_prob):
-    pi_a_given_s = tf.reduce_sum(policy * tf.one_hot(action, NUM_ACTIONS), 1)  # (B,)
-    importance = tf.clip_by_value(pi_a_given_s / (action_prob + 1e-8), 0, 10)
-
-    return tf.truediv(tf.reduce_sum(futurereward * importance), tf.cast(tf.shape(futurereward)[0], tf.float32))
-
 
 class Model(ModelDesc):
     def inputs(self):
@@ -85,21 +85,22 @@ class Model(ModelDesc):
                 tf.placeholder(tf.float32, (None,), 'action_prob'),
                 ]
 
-    def _get_NN_prediction(self, state):
+    @auto_reuse_variable_scope
+    def _get_NN_prediction(self, state, action, futurereward, action_prob):
         # image = tf.cast(image, tf.float32) / 255.0
         with argscope(FullyConnected, activation=tf.nn.relu):
             l = state
-            for i in range(5):
+            l = FullyConnected('fc', l, 64)
+            for i in range(3):
                 l = FullyConnected('fc%d' % i, l, 64)
 
         # l = FullyConnected('fc0', l, 64)
         # l = PReLU('prelu', l)
-        logits = FullyConnected('fc-pi', l, NUM_ACTIONS)    # unnormalized policy
-        return logits
+        policy = tf.nn.softmax(FullyConnected('fc-pi', l, NUM_ACTIONS), name='policy')    # unnormalized policy
+        return policy
 
     def build_graph(self, state, action, futurereward, action_prob):
-        logits = self._get_NN_prediction(state)
-        self.policy = tf.nn.softmax(logits, name='policy')
+        self.policy = self._get_NN_prediction(state, action, futurereward, action_prob)
         is_training = get_current_tower_context().is_training
         if not is_training:
             return
@@ -122,11 +123,11 @@ class Model(ModelDesc):
         self.cost = tf.truediv(cost, tf.cast(tf.shape(futurereward)[0], tf.float32), name='cost')
 
         summary.add_moving_summary(advantage, cost, tf.reduce_mean(importance, name='importance'))
-        return self.cost
+        return self.cost, self.policy
 
     def optimizer(self):
         # opt = tf.train.AdamOptimizer()
-        opt = trpo.ConjugateGradientOptimizer(self.policy, self.cost, delta=0.01)
+        opt = trpo.ConjugateGradientOptimizer(self.policy, delta=KL_TOLERANCE)
         gradprocs = [SummaryGradient()]
         opt = optimizer.apply_grad_processors(opt, gradprocs)
         return opt
@@ -205,15 +206,144 @@ class MySimulatorMaster(SimulatorMaster, Callback):
 
 
 class MyTrainer(SimpleTrainer):
-    pass
-    # def run_step(self):
-    #     print('step')
-    #     with TowerContext('', is_training=True):
-    #         print(self.hooked_sess.run(self.tower_func()))
-    #         print(self.hooked_sess.run(self.tower_func()))
-    #     self.hooked_sess.run(self.train_op)
-    #     with TowerContext('', is_training=True):
-    #         print(self.hooked_sess.run(self.tower_func()))
+    """
+    Single-GPU single-cost single-tower trainer.
+    """
+    def __init__(self):
+        super(MyTrainer, self).__init__()
+
+    def setup_graph2(self, inputs_desc, input, get_cost_fn, get_policy_fn, get_opt_fn):
+        """
+        Responsible for building the main training graph for single-cost training.
+
+        Args:
+            inputs_desc ([InputDesc]):
+            input (InputSource):
+            get_cost_fn ([tf.Tensor] -> tf.Tensor): callable, takes some input tensors and return a cost tensor.
+            get_opt_fn (-> tf.train.Optimizer): callable which returns an
+                optimizer. Will only be called once.
+
+        Note:
+            `get_cost_fn` will be the tower function.
+            It must follows the
+            `rules of tower function.
+            <http://tensorpack.readthedocs.io/en/latest/tutorial/trainer.html#tower-trainer>`_.
+        """
+        get_cost_fn = TowerFuncWrapper(get_cost_fn, inputs_desc)
+        get_policy_fn = TowerFuncWrapper(get_policy_fn, inputs_desc)
+        get_opt_fn = memoized(get_opt_fn)
+        self.tower_func = get_cost_fn
+
+        # TODO setup may want to register monitor as well??
+        input_callbacks = self._setup_input(inputs_desc, input)
+        train_callbacks = self._setup_graph2(input, get_cost_fn, get_policy_fn, get_opt_fn)
+        self.register_callback(input_callbacks + train_callbacks)
+
+    def _make_get_grad_fn(self, input, get_cost_fn, get_opt_fn):
+        """
+        Returns:
+            a get_grad_fn for GraphBuilder to use.
+        """
+        # internal use only
+        assert input.setup_done()
+
+        def get_grad_fn():
+            ctx = get_current_tower_context()
+            cost = get_cost_fn(*input.get_input_tensors())
+            if not ctx.is_training:
+                return None     # this is the tower function, could be called for inference
+
+            if ctx.has_own_variables:
+                varlist = ctx.get_collection_in_tower(tf.GraphKeys.TRAINABLE_VARIABLES)
+            else:
+                varlist = tf.trainable_variables()
+            opt = get_opt_fn()
+            grads = opt.compute_gradients(
+                cost, var_list=varlist,
+                gate_gradients=self.GATE_GRADIENTS,
+                colocate_gradients_with_ops=self.COLOCATE_GRADIENTS_WITH_OPS,
+                aggregation_method=self.AGGREGATION_METHOD)
+            grads = FilterNoneGrad().process(grads)
+            return grads, cost
+
+        return get_grad_fn
+
+    def _setup_graph2(self, input, get_cost_fn, get_policy_fn, get_opt_fn):
+        logger.info("Building graph for a single training tower ...")
+        with TowerContext('', is_training=True):
+            grads, self.cost = self._make_get_grad_fn(input, get_cost_fn, get_opt_fn)()
+            self.policy = get_policy_fn(*input.get_input_tensors())
+            opt = get_opt_fn()
+            with tf.control_dependencies([self.cost, self.policy, opt.apply_gradients(grads, name='min_op')]):
+                self.cost_after = get_cost_fn(*input.get_input_tensors())
+                self.policy_after = get_policy_fn(*input.get_input_tensors())
+        self.cache_vars = [tf.Variable(v.initialized_value(), trainable=False) for v in tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)]
+        self.var2cache = control_flow_ops.group([state_ops.assign(c, v) for c, v in zip(self.cache_vars, tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES))])
+        self.cache2var = control_flow_ops.group([state_ops.assign(v, c) for c, v in zip(self.cache_vars, tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES))])
+        return []
+
+    def run_step(self):
+        # print('step')
+        # with TowerContext('', is_training=True):
+        #     print(self.hooked_sess.run(self.cost))
+        cost_before, policy_before, cost_after, policy_after = self.hooked_sess.run([self.cost, self.policy, self.cost_after, self.policy_after])
+        # calculate KL
+        mean_KL = np.mean(np.sum(policy_before * np.log(policy_before / (policy_after + 1e-8) + 1e-8), 1))
+        # did not improve the reward or KL diverges
+        if cost_after < cost_before or mean_KL > KL_TOLERANCE:
+            self.hooked_sess.run([self.cache2var])
+        else:
+            self.hooked_sess.run([self.var2cache])
+        # print(cost_before)
+        # print(cost_after)
+        # with TowerContext('', is_training=True):
+        #     print(self.hooked_sess.run(self.tower_func()))
+
+
+def launch_train_with_config2(config, trainer):
+    """
+    Train with a :class:`TrainConfig` and a :class:`Trainer`, to
+    present a simple training interface. It basically does the following
+    3 things (and you can easily do them by yourself if you need more control):
+
+    1. Setup the input with automatic prefetching,
+       from `config.data` or `config.dataflow`.
+    2. Call `trainer.setup_graph` with the input as well as `config.model`.
+    3. Call `trainer.train` with rest of the attributes of config.
+
+    Args:
+        config (TrainConfig):
+        trainer (Trainer): an instance of :class:`SingleCostTrainer`.
+
+    Examples:
+
+    .. code-block:: python
+
+        launch_train_with_config(
+            config, SyncMultiGPUTrainerParameterServer(8, ps_device='gpu'))
+    """
+    assert isinstance(trainer, SingleCostTrainer), trainer
+    assert isinstance(config, TrainConfig), config
+    assert config.model is not None
+    assert config.dataflow is not None or config.data is not None
+
+    model = config.model
+    inputs_desc = model.get_inputs_desc()
+    input = config.data or config.dataflow
+    input = apply_default_prefetch(input, trainer)
+
+    trainer.setup_graph2(
+        inputs_desc, input,
+        model._build_graph_get_cost, lambda *inputs: model._get_NN_prediction(*inputs), model.get_optimizer)
+    trainer.train_with_defaults(
+        callbacks=config.callbacks,
+        monitors=config.monitors,
+        session_creator=config.session_creator,
+        session_init=config.session_init,
+        steps_per_epoch=config.steps_per_epoch,
+        starting_epoch=config.starting_epoch,
+        max_epoch=config.max_epoch,
+        extra_callbacks=config.extra_callbacks)
 
 
 def train():
@@ -269,19 +399,7 @@ def train():
         max_epoch=1000,
     )
     trainer = MyTrainer() if config.nr_tower == 1 else AsyncMultiGPUTrainer(train_tower)
-    launch_train_with_config(config, trainer)
-
-
-def test():
-    import gym
-    env = gym.make('CartPole-v0')
-    episode = 100
-    for i in range(episode):
-        done = False
-        env.reset()
-        while not done:
-            env.render()
-            _, _, done, _ = env.step(env.action_space.sample())
+    launch_train_with_config2(config, trainer)
 
 
 if __name__ == '__main__':

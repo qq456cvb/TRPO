@@ -24,15 +24,15 @@ class ConjugateGradientOptimizer(optimizer.Optimizer):
     # cg_iter: conjugate gradient iteration
     # ls_max_iter: line search max iteration
     # back_trace_ratio: backward line search ratio per iteration
-    def __init__(self, actions, cost, delta=0.01, cg_iter=10, ls_max_iter=15, back_trace_ratio=0.8, use_locking=False, name="ConjGradient"):
+    def __init__(self, policy, delta=0.01, cg_iter=10, ls_max_iter=15, back_trace_ratio=0.8, use_locking=False, name="ConjGradient"):
         super(ConjugateGradientOptimizer, self).__init__(use_locking, name)
         self._cg_iter = cg_iter
         self._delta = delta
         self._ls_max_iter = ls_max_iter
         self._back_trace_ratio = back_trace_ratio
-        self._actions = actions
-        self._cost = cost
-        self._mean_KL = tf.reduce_mean(tf.reduce_sum(tf.stop_gradient(actions) * tf.log(tf.stop_gradient(actions) / (actions + 1e-8) + 1e-8), 1))
+        # self._actions = actions
+        self._policy = policy
+        self._mean_KL = tf.reduce_mean(tf.reduce_sum(tf.stop_gradient(self._policy) * tf.log(tf.stop_gradient(self._policy) / (self._policy + 1e-8) + 1e-8), 1))
 
         # Tensor versions of the constructor arguments, created in _prepare().
         self._lr_t = None
@@ -80,9 +80,7 @@ class ConjugateGradientOptimizer(optimizer.Optimizer):
         p = tf.stop_gradient(r)
         x = tf.zeros_like(g)
         for i in range(self._cg_iter):
-            print('tik')
             Ap = Hx_fn(p)
-            print('tok')
             rr = tf.reduce_sum(r * r)
             alpha = rr / tf.reduce_sum(p * Ap)
             x = tf.cond(tf.norm(r) > 1e-5, lambda: x + alpha * p, lambda: tf.identity(x))
@@ -147,15 +145,14 @@ class ConjugateGradientOptimizer(optimizer.Optimizer):
             xHx = tf.reduce_sum(tf.transpose(x) * Hx_fn(x))
             beta = tf.sqrt(2 * self._delta_t / (xHx + 1e-8))
 
-            # backward line search
-            i = tf.constant(0)
-            c = lambda i, beta: tf.logical_and(i < self._ls_max_iter_t, 0.5 * beta * beta * xHx > self._delta_t)
-            b = lambda i, beta: [i + 1, self._back_trace_ratio_t * beta]
-            _, beta = tf.while_loop(c, b, loop_vars=[i, beta], back_prop=False)
+            # backward line search, no use now, we need true KL,
+            # TODO: find an elegant way to do it, instead of tf.Session.run
+            # i = tf.constant(0)
+            # c = lambda i, beta: tf.logical_and(i < self._ls_max_iter_t, 0.5 * beta * beta * xHx > self._delta_t)
+            # b = lambda i, beta: [i + 1, self._back_trace_ratio_t * beta]
+            # _, beta = tf.while_loop(c, b, loop_vars=[i, beta], back_prop=False)
 
-            # check again
-            kl = 0.5 * beta * beta * xHx
-            var_update = tf.cond(tf.logical_and(kl < self._delta_t, tf.logical_not(tf.reduce_any(tf.is_nan(x)))),
+            var_update = tf.cond(tf.logical_not(tf.reduce_any(tf.is_nan(x))),
                                  lambda: control_flow_ops.group([state_ops.assign_add(var, beta * tf.reshape(x[slice_idx[i]:slice_idx[i+1]], var_shapes[i])) for i, (_, var) in enumerate(grads_and_vars)]),
                                  lambda: tf.zeros(0, dtype=tf.bool))
 
@@ -165,7 +162,11 @@ class ConjugateGradientOptimizer(optimizer.Optimizer):
                 train_op = ops.get_collection_ref(ops.GraphKeys.TRAIN_OP)
                 if var_update not in train_op:
                     train_op.append(var_update)
-
+            # with tf.control_dependencies([self._cost]):
+            #     with tf.control_dependencies([var_update]):
+            #         cost = self._cost + 0
+            #         with tf.control_dependencies([cost]):
+            #             cost = cost + 0
             return var_update
 
     # calculate mean KL
