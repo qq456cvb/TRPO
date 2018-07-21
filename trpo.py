@@ -164,18 +164,6 @@ class TestModel(ModelDesc):
     def optimizer(self):
         return ConjugateGradientOptimizer(self.action, 0.1)
 
-#
-# class MyTrainer(SimpleTrainer):
-#
-#     def run_step(self):
-#         print('step')
-#         with TowerContext('', is_training=True):
-#             print(self.hooked_sess.run(self.tower_func()))
-#             print(self.hooked_sess.run(self.tower_func()))
-#         self.hooked_sess.run(self.train_op)
-#         with TowerContext('', is_training=True):
-#             print(self.hooked_sess.run(self.tower_func()))
-
 
 if __name__ == '__main__':
     trainer = SimpleTrainer()
