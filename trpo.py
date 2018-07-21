@@ -24,7 +24,7 @@ class ConjugateGradientOptimizer(optimizer.Optimizer):
     # cg_iter: conjugate gradient iteration
     # ls_max_iter: line search max iteration
     # back_trace_ratio: backward line search ratio per iteration
-    def __init__(self, policy, delta=0.01, cg_iter=10, ls_max_iter=15, back_trace_ratio=0.8, use_locking=False, name="ConjGradient"):
+    def __init__(self, policy, cost, delta=0.01, cg_iter=10, ls_max_iter=15, back_trace_ratio=0.8, use_locking=False, name="ConjGradient"):
         super(ConjugateGradientOptimizer, self).__init__(use_locking, name)
         self._cg_iter = cg_iter
         self._delta = delta
@@ -32,8 +32,8 @@ class ConjugateGradientOptimizer(optimizer.Optimizer):
         self._back_trace_ratio = back_trace_ratio
         # self._actions = actions
         self._policy = policy
+        self._cost_before = cost
         self._mean_KL = tf.reduce_mean(tf.reduce_sum(tf.stop_gradient(self._policy) * tf.log(tf.stop_gradient(self._policy) / (self._policy + 1e-8) + 1e-8), 1))
-
         # Tensor versions of the constructor arguments, created in _prepare().
         self._lr_t = None
 
@@ -122,6 +122,13 @@ class ConjugateGradientOptimizer(optimizer.Optimizer):
         # converted_grads_and_vars = tuple(converted_grads_and_vars)
         converted_grads_and_vars = tuple([(g, v) for g, v in converted_grads_and_vars if g is not None])
         var_list = [v for g, v in converted_grads_and_vars]
+        cache_var_list = []
+        for v in var_list:
+            for c in self.cache_vars:
+                if c.op.name == v.op.name + 'cache':
+                    cache_var_list.append(c)
+                    break
+        assert len(var_list) == len(cache_var_list)
         if not var_list:
             raise ValueError("No gradients provided for any variable: %s." %
                              ([v.name for _, v in converted_grads_and_vars],))
@@ -145,16 +152,26 @@ class ConjugateGradientOptimizer(optimizer.Optimizer):
             xHx = tf.reduce_sum(tf.transpose(x) * Hx_fn(x))
             beta = tf.sqrt(2 * self._delta_t / (xHx + 1e-8))
 
-            # backward line search, no use now, we need true KL,
-            # TODO: find an elegant way to do it, instead of tf.Session.run
-            # i = tf.constant(0)
-            # c = lambda i, beta: tf.logical_and(i < self._ls_max_iter_t, 0.5 * beta * beta * xHx > self._delta_t)
-            # b = lambda i, beta: [i + 1, self._back_trace_ratio_t * beta]
-            # _, beta = tf.while_loop(c, b, loop_vars=[i, beta], back_prop=False)
+            def get_KL(policy):
+                return tf.reduce_mean(tf.reduce_sum(tf.stop_gradient(self._policy) * tf.log(
+                    tf.stop_gradient(self._policy) / (policy + 1e-8) + 1e-8), 1))
 
-            var_update = tf.cond(tf.logical_not(tf.reduce_any(tf.is_nan(x))),
-                                 lambda: control_flow_ops.group([state_ops.assign_add(var, beta * tf.reshape(x[slice_idx[i]:slice_idx[i+1]], var_shapes[i])) for i, (_, var) in enumerate(grads_and_vars)]),
-                                 lambda: tf.zeros(0, dtype=tf.bool))
+            i = tf.constant(0)
+
+            def c(i, beta):
+                with tf.control_dependencies([control_flow_ops.group(
+                        [state_ops.assign(var, cache_var_list[i] - beta * tf.reshape(x[slice_idx[i]:slice_idx[i + 1]], var_shapes[i])) for
+                         i,  (_, var) in enumerate(grads_and_vars)])]):
+                    kl = get_KL(self.policy_fn())
+                    cost = self.cost_fn()
+                    return tf.logical_and(i < self._ls_max_iter_t, tf.logical_or(kl > self._delta_t,
+                               cost > self._cost_before))
+            b = lambda i, beta: [i + 1, self._back_trace_ratio_t * beta]
+            i, _ = tf.while_loop(c, b, loop_vars=[i, beta], back_prop=False)
+
+            var_update = tf.cond(tf.logical_or(tf.equal(i, self._ls_max_iter_t), tf.logical_not(tf.reduce_any(tf.is_nan(x)))),
+                                 lambda: self.cache2var,
+                                 lambda: self.var2cache)
 
             if not context.executing_eagerly():
                 if isinstance(var_update, ops.Tensor):
