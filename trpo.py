@@ -47,35 +47,6 @@ class ConjugateGradientOptimizer(optimizer.Optimizer):
         pass
 
     def cg(self, Hx_fn, g):
-        # i_init = tf.constant(0)
-        # # conjugate gradient method
-        # r_init = g + 0
-        # # r = tf.Print(r, [tf.norm(r)])
-        # p_init = r_init + 0
-        # x_init = tf.zeros_like(g)
-        # c = lambda i, x, r, p: tf.logical_and(i < self._cg_iter_t, tf.norm(r) > 1e-5)
-        #
-        # def cb(i, x, r, p):
-        #     # Ap = tf.matmul(A, p)
-        #     Ap = Hx_fn(p)
-        #     rr = tf.reduce_sum(r * r)
-        #     alpha = rr / tf.reduce_sum(p * Ap)
-        #     x = x + alpha * p
-        #     r_old = r
-        #     r = r_old - alpha * Ap
-        #     # r = tf.Print(r, [tf.reduce_sum(r * r_old)])
-        #     # due to numerical error, the following check does not pass
-        #     # with tf.control_dependencies([tf.assert_equal(tf.reduce_sum(r * r_old), 0.)]):
-        #     beta = tf.reduce_sum(r * r) / rr
-        #     p_old = p
-        #     p = r + beta * p_old
-        #     # p = tf.Print(p, [tf.norm(r)])
-        #     # p = tf.Print(p, [tf.reduce_sum(p * tf.matmul(hess, p))])
-        #     # with tf.control_dependencies([tf.assert_equal(tf.reduce_sum(p * p_old), 0.)]):
-        #     #     p = tf.identity(p)
-        #     return i + 1, x, r, p
-        #
-        # return tf.while_loop(c, cb, loop_vars=[i_init, x_init, r_init, p_init], back_prop=False)[1]
         r = tf.stop_gradient(g)
         p = tf.stop_gradient(r)
         x = tf.zeros_like(g)
@@ -93,9 +64,6 @@ class ConjugateGradientOptimizer(optimizer.Optimizer):
             p_old = p
             p = r + beta * p_old
         return x
-        # p = tf.Print(p, [tf.norm(r)])
-        # p = tf.Print(p, [tf.reduce_sum(p * tf.matmul(hess, p))])
-        # return x
 
     def apply_gradients(self, grads_and_vars, global_step=None, name=None):
 
@@ -179,89 +147,7 @@ class ConjugateGradientOptimizer(optimizer.Optimizer):
                 train_op = ops.get_collection_ref(ops.GraphKeys.TRAIN_OP)
                 if var_update not in train_op:
                     train_op.append(var_update)
-            # with tf.control_dependencies([self._cost]):
-            #     with tf.control_dependencies([var_update]):
-            #         cost = self._cost + 0
-            #         with tf.control_dependencies([cost]):
-            #             cost = cost + 0
             return var_update
-
-    # calculate mean KL
-    # def _apply_dense(self, grad, var):
-    #     # action_shape = tf.shape(self._actions)
-    #     # stacked_actions = tf.reshape(self._actions, [-1])
-    #     # grad = tf.Print(grad, [tf.norm(grad)])
-    #
-    #     # var_1d_shape = tf.reduce_prod(tf.shape(var))
-    #     var_shape = tf.shape(var)
-    #     var_1d_shape = tf.reduce_prod(tf.shape(var))
-    #     # J = tf.zeros(tf.stack([0, tf.reduce_prod(tf.shape(var))]), dtype=tf.float32)
-    #     #
-    #     i = tf.constant(0)
-    #     # grad = tf.Print(grad, [self._cost])
-    #     # c = lambda i, g: i < tf.shape(stacked_actions)[-1]
-    #     # b = lambda i, g: [i + 1, tf.concat([g, tf.expand_dims(tf.reshape(tf.gradients(stacked_actions[i], var)[0], [-1]), 0)], axis=0)]
-    #     # _, J = tf.while_loop(c, b, loop_vars=[i, J], shape_invariants=[i.get_shape(), tf.TensorShape([None, None])], back_prop=False)
-    #     #
-    #     # # J: NA * V
-    #     # with tf.control_dependencies([tf.assert_equal(tf.reduce_any(tf.is_nan(J)), False)]):
-    #     #  J = tf.reshape(J, tf.stack([-1, action_shape[-1], tf.reduce_prod(tf.shape(var))]))
-    #     # # A : N*V*V
-    #     # # use the trick in the paper: A = JtMJ, where M is the fisher information matrix of multinomial distribution
-    #     # A = tf.map_fn(lambda x: tf.matmul(tf.transpose(x[0]), tf.matmul(tf.diag(1. / (x[1] + 1e-5)), x[0])), (J, self._actions), dtype=tf.float32, back_prop=False)
-    #     # with tf.control_dependencies([tf.assert_less(tf.reduce_sum(tf.transpose(A[0])-A[0]), 1e-3)]):
-    #     #     A = tf.identity(A)
-    #     # A = tf.reduce_mean(A, [0]) + 1e-5 * tf.eye(tf.reduce_prod(tf.shape(var)))
-    #
-    #     # Hx = lambda x: tf.reshape(tf.gradients(tf.reduce_sum(tf.reshape(tf.gradients(self._mean_KL, var), [-1]) * x), var), [-1])
-    #     hess = tf.hessians(self._mean_KL, var)[0]
-    #     hess = tf.reshape(hess, [var_1d_shape, var_1d_shape])
-    #     with tf.control_dependencies([tf.assert_less(tf.reduce_sum(tf.transpose(hess[0]) - hess[0]), 1e-3)]):
-    #         hess = tf.identity(hess)
-    #
-    #     x = self.cg(hess, tf.expand_dims(tf.reshape(grad, [-1]), -1))
-    #     # x = tf.Print(x, [x], first_n=100)
-    #     xAx = tf.reshape(tf.matmul(tf.transpose(x), tf.matmul(hess, x)), [])
-    #     # with tf.control_dependencies([tf.assert_equal(tf.reduce_any(tf.is_nan(x)), False)]):
-    #     with tf.control_dependencies(None):
-    #         beta = tf.sqrt(2 * self._delta_t / (xAx + 1e-8))
-    #     x = tf.reshape(x, var_shape)
-    #     grad = x + 0
-    #
-    #     i = tf.constant(0)
-    #     c = lambda i, beta: tf.logical_and(i < self._ls_max_iter_t, 0.5 * beta * beta * xAx > self._delta_t)
-    #     b = lambda i, beta: [i + 1, self._back_trace_ratio_t * beta]
-    #     _, beta = tf.while_loop(c, b, loop_vars=[i, beta], back_prop=False)
-    #
-    #     # check again
-    #     kl = 0.5 * beta * beta * xAx
-    #     # beta_t = math_ops.cast(beta, var.dtype.base_dtype)
-    #
-    #     var_update = tf.cond(tf.logical_and(kl < self._delta_t, tf.logical_not(tf.reduce_any(tf.is_nan(grad)))), lambda: state_ops.assign_add(var, beta * grad), lambda: state_ops.assign_add(var, tf.zeros_like(var)))
-    #     # Create an op that groups multiple operations.
-    #     # When this op finishes, all ops in input have finished
-    #     return control_flow_ops.group(var_update)
-
-    def _apply_sparse(self, grad, var):
-        raise NotImplementedError("Sparse gradient updates are not supported.")
-
-    # def _finish(self, update_ops, name_scope):
-    #     """Do what is needed to finish the update.
-    #
-    #     This is called with the `name_scope` using the "name" that
-    #     users have chosen for the application of gradients.
-    #
-    #     Args:
-    #       update_ops: List of `Operation` objects to update variables.  This list
-    #         contains the values returned by the `_apply_dense()` and
-    #         `_apply_sparse()` calls.
-    #       name_scope: String.  Name to use for the returned operation.
-    #
-    #     Returns:
-    #       The operation to apply updates.
-    #     """
-    #     with tf.control_dependencies([tf.Print(tf.zeros([1]), [self._cost])]):
-    #         return control_flow_ops.group(*update_ops, name=name_scope)
 
 
 class TestModel(ModelDesc):

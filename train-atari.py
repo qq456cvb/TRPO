@@ -324,10 +324,6 @@ def train():
         dataflow=dataflow,
         callbacks=[
             ModelSaver(),
-            # ScheduledHyperParamSetter('learning_rate', [(20, 0.0003), (120, 0.0001)]),
-            # ScheduledHyperParamSetter('entropy_beta', [(80, 0.005)]),
-            # HumanHyperParamSetter('learning_rate'),
-            # HumanHyperParamSetter('entropy_beta'),
             master,
             StartProcOrThread(master),
             PeriodicTrigger(Evaluator(
