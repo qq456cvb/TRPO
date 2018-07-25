@@ -115,7 +115,7 @@ class Model(ModelDesc):
 
     def optimizer(self):
         # opt = tf.train.AdamOptimizer()
-        opt = trpo.ConjugateGradientOptimizer(self.policy, self.cost, delta=0.01)
+        opt = trpo.ConjugateGradientOptimizer(self.policy, self.cost, delta=0.1)
         gradprocs = [SummaryGradient()]
         opt_proc = optimizer.apply_grad_processors(opt, gradprocs)
         return opt_proc, opt
